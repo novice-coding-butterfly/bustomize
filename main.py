@@ -20,7 +20,6 @@ bl_info = {
     "location" : "View3D > Sidebar > bustomize Tab",
     "category" : "Rigging"
 }
-
 import bpy
 import base64
 import json
@@ -76,25 +75,91 @@ class Bustomize(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context):
         settings: Settings = context.scene.bustomize_settings
-        version, cplus_dict = translate_hash(settings.cplus_hash)
+        cplus_dict = translate_hash(settings.cplus_hash)
         scale_dict = get_bone_values(cplus_dict, 'Scaling')
-
-        if not is_valid(self, context, version, (scale_dict, None, None)):
-            return {'CANCELLED'}
-
         target_armature = settings.target_armature
+        
+        bpy.context.view_layer.objects.active = target_armature
 
+        if not is_valid(self, context, (scale_dict, None, None)):
+            return {'CANCELLED'}
+        
+        # Ensure we're in edit mode
+        bpy.ops.object.mode_set(mode='EDIT')
+        
+        # Store the parent relationships and ensure we're getting valid data
+        parent_dict = {}
+        for bone in target_armature.data.edit_bones:
+            if bone.parent is not None:
+                print(f"Storing parent for {bone.name}: {bone.parent.name}")  # Debug print
+                parent_dict[bone.name] = bone.parent.name
+                
+        
+        # Clear parents
+        for bone in target_armature.data.edit_bones:
+            target_armature.data.edit_bones.active = bone
+            bpy.ops.armature.parent_clear(type='CLEAR')
+       
+        bpy.ops.object.mode_set(mode='POSE')
+        
         # unlink parent bone scaling for ALL bones
         # apply scale to pose bones in bonescale dict
         for posebone in target_armature.pose.bones:
-            posebone.bone.inherit_scale = 'NONE'
+            bpy.ops.armature.inherit_scale = 'NONE'    
             scale_vector = scale_dict[posebone.name]
             if scale_vector:
                 if settings.flip_axes:
                     posebone.scale = mathutils.Vector((scale_vector['Z'], scale_vector['X'], scale_vector['Y']))
                 else:
-                    posebone.scale = mathutils.Vector((scale_vector['X'], scale_vector['Y'], scale_vector['Z']))
+                    posebone.scale = mathutils.Vector((scale_vector['X'], scale_vector['Y'], scale_vector['Z']))   
+          
+        
+        mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
 
+        if mesh_objects:
+            # Select the mesh objects
+            for obj in mesh_objects:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = mesh_objects[0]
+                        
+            # Apply constrants in a stupid way
+            bpy.ops.object.convert(target='MESH')
+                        
+            # Join the mesh objects
+            bpy.ops.object.join()
+            bpy.context.object.name = "Character Mesh"
+            character_mesh = bpy.data.objects["Character Mesh"]
+            
+            # Clear armature transforms in pose mode
+            bpy.context.view_layer.objects.active = target_armature
+            bpy.ops.object.mode_set(mode='POSE')
+            bpy.ops.pose.select_all(action='SELECT')
+            bpy.ops.pose.transforms_clear()
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # Add armature modifier to mesh and set target
+            bpy.context.view_layer.objects.active = character_mesh
+            bpy.context.object.modifiers.new(type='ARMATURE', name='Armature')
+            bpy.context.object.modifiers['Armature'].object = target_armature
+        
+        # Ensure we're in edit mode
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = target_armature
+        bpy.ops.object.mode_set(mode='EDIT')
+            
+        # Then restore parents in a separate pass
+        for bone in bpy.context.active_object.data.edit_bones:
+            # Check if the bone is in the dictionary (i.e., it has a parent)
+            if bone.name in parent_dict:
+                parent_name = parent_dict[bone.name]
+                try:
+                    bone.parent = bpy.context.active_object.data.edit_bones[parent_name]
+            
+                except Exception as e:
+                    print(f"Error restoring parent for {bone.name}: {e}")
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        # Update flag to applied
         settings.scale_was_applied = True
         return {'FINISHED'}
 
@@ -121,12 +186,12 @@ class BustomizeRotPos(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context):
         settings: Settings = context.scene.bustomize_settings
-        version, cplus_dict = translate_hash(settings.cplus_hash)
+        cplus_dict = translate_hash(settings.cplus_hash)
         pos_dict = get_bone_values(cplus_dict, 'Translation')
         rot_dict = get_bone_values(cplus_dict, 'Rotation')
         target_armature = settings.target_armature
 
-        if not is_valid(self, context, version, (None, rot_dict, pos_dict)):
+        if not is_valid(self, context, (None, rot_dict, pos_dict)):
             return {'CANCELLED'}
 
         # find bones to DUPE
@@ -232,15 +297,10 @@ def translate_hash(the_hasherrrr: str):
     bytes = base64.b64decode(the_hasherrrr)
     bytes_array = bytearray(bytes)
 
-    # TODO: this is 31 when c+ version should be 4. 'version' key in json is correct
-    version_byte = bytes_array[0]
-
     json_str = zlib.decompress(bytes_array, zlib.MAX_WBITS|16).decode('utf-8')
     json_dict = json.loads(json_str[1:])
 
-    version = json_dict['Version']
-
-    return version, json_dict
+    return json_dict
 
 def get_bone_values(cplus_dict: dict, value_key: str):
     bones = cplus_dict['Bones']
@@ -259,11 +319,7 @@ def get_bone_values(cplus_dict: dict, value_key: str):
 '''
 tuple = scale[0], rot[1], pos[2]
 '''
-def is_valid(self, context, ver, tuple):
-    if ver != 4:
-        self.report({'ERROR'}, 'C+ string version {ver} incompatible; bustomize expects 4')
-        return False
-
+def is_valid(self, context, tuple):
     settings: Settings = context.scene.bustomize_settings
 
     # validate target armature contents
@@ -281,13 +337,7 @@ def is_valid(self, context, ver, tuple):
     if scale:
         target_bone_names = []
         for bone in target_armature.data.bones:
-            if bone.inherit_scale != "FULL":
-                self.report({'ERROR'}, f'Armature contains bone {bone.name} which does not inherit parent bone scaling')
-                return False
             target_bone_names.append(bone.name)
-
-        # TODO: Armature contains bone j_asi_b_l with unexpected scale: <Vector (1.0000, 1.0000, 1.0000)>
-        # check for scale that's 'close enough' to 1.0
 
         missing_bones = []
         for bonescale_name in scale.keys():
